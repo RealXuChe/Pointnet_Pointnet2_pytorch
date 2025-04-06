@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from time import time
 import numpy as np
+from torch_geometric.nn import fps
 
 def timeit(tag, t):
     print("{}: {}s".format(tag, time() - t))
@@ -42,21 +43,51 @@ def square_distance(src, dst):
 
 def index_points(points, idx):
     """
+    根据 idx 的维度选择不同的优化策略。
+    - 如果 idx 是 2D ([B, S]), 使用 torch.gather。
+    - 如果 idx 是 3D ([B, S, K]), 使用高级索引，但优化 batch_indices 创建。
 
     Input:
         points: input points data, [B, N, C]
-        idx: sample index data, [B, S]
+        idx: sample index data, [B, S] or [B, S, K]
     Return:
-        new_points:, indexed points data, [B, S, C]
+        new_points:, indexed points data, [B, S, C] or [B, S, K, C]
     """
     device = points.device
-    B = points.shape[0]
-    view_shape = list(idx.shape)
-    view_shape[1:] = [1] * (len(view_shape) - 1)
-    repeat_shape = list(idx.shape)
-    repeat_shape[0] = 1
-    batch_indices = torch.arange(B, dtype=torch.long).to(device).view(view_shape).repeat(repeat_shape)
-    new_points = points[batch_indices, idx, :]
+    B, N, C = points.shape
+
+    if idx.dim() == 2:
+        # --- Case 1: idx is [B, S] ---
+        # Output shape should be [B, S, C]
+        # gather 要求 index 和 input 维度数相同 (都为 3)
+        S = idx.shape[1]
+        # 创建形状为 [B, S, C] 的索引张量，用于 gather
+        # idx: [B, S] -> unsqueeze: [B, S, 1] -> expand: [B, S, C]
+        idx_expanded = idx.unsqueeze(-1).expand(B, S, C)
+        # 沿 dim=1 (N 维度) 收集
+        # new_points[b, s, c] = points[b, idx_expanded[b, s, c], c]
+        new_points = torch.gather(points, 1, idx_expanded)
+
+    elif idx.dim() == 3:
+        # --- Case 2: idx is [B, S, K] ---
+        # Output shape should be [B, S, K, C]
+        # gather 不适用 (维度不匹配) -> 使用高级索引
+        S, K = idx.shape[1], idx.shape[2]
+
+        # 优化 batch_indices 的创建，使用 expand 替代 repeat
+        # 目标形状: [B, S, K]
+        # 1. 创建 [B, 1, 1] 的 arange
+        # 2. expand 到 [B, S, K]
+        batch_indices = torch.arange(B, dtype=torch.long, device=device).view(B, 1, 1).expand(B, S, K)
+
+        # 使用高级索引: points[batch_indices, idx, :]
+        # batch_indices 提供 B 维索引，idx 提供 N 维索引，: 提供 C 维索引
+        # 输出形状由 batch_indices 和 idx 广播决定，为 [B, S, K, C]
+        new_points = points[batch_indices, idx, :]
+
+    else:
+        raise ValueError(f"Unsupported index dimensions: {idx.dim()}. Expected 2 or 3.")
+
     return new_points
 
 
@@ -70,40 +101,133 @@ def farthest_point_sample(xyz, npoint):
     """
     device = xyz.device
     B, N, C = xyz.shape
-    centroids = torch.zeros(B, npoint, dtype=torch.long).to(device)
-    distance = torch.ones(B, N).to(device) * 1e10
-    farthest = torch.randint(0, N, (B,), dtype=torch.long).to(device)
-    batch_indices = torch.arange(B, dtype=torch.long).to(device)
-    for i in range(npoint):
-        centroids[:, i] = farthest
-        centroid = xyz[batch_indices, farthest, :].view(B, 1, 3)
-        dist = torch.sum((xyz - centroid) ** 2, -1)
-        mask = dist < distance
-        distance[mask] = dist[mask]
-        farthest = torch.max(distance, -1)[1]
-    return centroids
+    
+    xyz_reshaped = xyz.reshape(B * N, C)
+    batch = torch.arange(B, dtype=torch.long, device=device).repeat_interleave(N)
+    
+    index = fps(xyz_reshaped, batch, ratio=npoint / N, random_start=True, batch_size=B)
+    
+    centroids_global = index.view(B, npoint)
+    batch_offsets = torch.arange(B, dtype=torch.long, device=device).unsqueeze(1) * N
+    centroids_local = centroids_global - batch_offsets
 
+    return centroids_local
 
-def query_ball_point(radius, nsample, xyz, new_xyz):
+from torch_geometric.nn.pool import radius as radius_cluster
+
+def query_ball_point(radius: float, nsample: int, xyz: torch.Tensor, new_xyz: torch.Tensor) -> torch.Tensor:
     """
+    使用 torch_geometric.nn.pool.radius (torch_cluster) 的 query_ball_point。
+
     Input:
-        radius: local region radius
-        nsample: max sample number in local region
-        xyz: all points, [B, N, 3]
-        new_xyz: query points, [B, S, 3]
+        radius: local region radius (局部区域半径)
+        nsample: max sample number in local region (局部区域最大采样点数)
+        xyz: all points, [B, N, 3] (所有点)
+        new_xyz: query points, [B, S, 3] (查询点/中心点)
     Return:
-        group_idx: grouped points index, [B, S, nsample]
+        group_idx: grouped points index, [B, S, nsample] (分组点的索引)
     """
     device = xyz.device
     B, N, C = xyz.shape
     _, S, _ = new_xyz.shape
-    group_idx = torch.arange(N, dtype=torch.long).to(device).view(1, 1, N).repeat([B, S, 1])
-    sqrdists = square_distance(new_xyz, xyz)
-    group_idx[sqrdists > radius ** 2] = N
-    group_idx = group_idx.sort(dim=-1)[0][:, :, :nsample]
-    group_first = group_idx[:, :, 0].view(B, S, 1).repeat([1, 1, nsample])
-    mask = group_idx == N
-    group_idx[mask] = group_first[mask]
+
+    if B == 0 or N == 0 or S == 0:
+        return torch.empty(B, S, nsample, dtype=torch.long, device=device)
+
+    # 1. 数据格式转换以适配 torch_cluster.radius
+    xyz_flat = xyz.reshape(B * N, C)
+    new_xyz_flat = new_xyz.reshape(B * S, C)
+
+    # 创建 batch 索引向量
+    batch_x = torch.arange(B, dtype=torch.long, device=device).view(B, 1).repeat(1, N).flatten() # B*N
+    batch_y = torch.arange(B, dtype=torch.long, device=device).view(B, 1).repeat(1, S).flatten() # B*S
+
+    # 2. 调用 torch_geometric.nn.pool.radius (底层是 torch_cluster)
+    # 它返回的是 [2, num_pairs] 的索引张量，row[0]是y(查询点)的索引, row[1]是x(邻居点)的索引
+    # 注意：这里的索引是相对于 xyz_flat 和 new_xyz_flat 的全局索引
+    # 我们将 nsample 传递给 max_num_neighbors
+    # 注意：torch_cluster.radius 可能使用不同的策略处理超过 max_num_neighbors 的情况（例如随机采样），
+    # 而原始实现是排序后取前 nsample 个。这是一个潜在的行为差异。
+    assign_index = radius_cluster(
+        x=xyz_flat,                # 源点云 (邻居候选)
+        y=new_xyz_flat,            # 查询点
+        r=radius,                  # 半径
+        batch_x=batch_x,           # 源点云的 batch 索引
+        batch_y=batch_y,           # 查询点的 batch 索引
+        max_num_neighbors=nsample, # 最大邻居数
+        num_workers=1             # 通常在 GPU 上此参数无效，设为1
+    )
+
+    # 3. 结果格式转换与填充，以匹配原始输出 [B, S, nsample]
+
+    # 获取查询点索引 (相对于 new_xyz_flat) 和邻居点索引 (相对于 xyz_flat)
+    # y_idx_flat: 范围 [0, B*S - 1]
+    # x_idx_flat: 范围 [0, B*N - 1]
+    y_idx_flat = assign_index[0]
+    x_idx_flat = assign_index[1]
+
+    # 如果没有找到任何邻居对
+    if assign_index.shape[1] == 0:
+        # 原始实现会用第一个点（如果存在）填充，但如果根本找不到点（都在半径外），
+        # 它会填充 N。这里我们遵循后一种情况，因为 radius_cluster 找不到就不会返回。
+        # 但原始代码有一个特殊情况：如果半径内有点，但少于nsample，会用第一个点填充。
+        # 为了模拟这一点，我们先用 N 填充。
+        # 稍后会处理用第一个点填充的情况。
+        group_idx = torch.full((B, S, nsample), N, dtype=torch.long, device=device)
+        return group_idx
+
+    # 将邻居点的全局索引转换为 batch 内的索引
+    # x_idx_in_batch: 范围 [0, N - 1]
+    x_idx_in_batch = x_idx_flat % N
+
+    # 获取查询点的 batch 索引和 batch 内索引
+    # b_idx: 范围 [0, B - 1]
+    # s_idx_in_batch: 范围 [0, S - 1]
+    b_idx = y_idx_flat // S
+    s_idx_in_batch = y_idx_flat % S
+
+    # 创建最终的输出张量，并初始化为一个特殊值（例如 -1 或 N）
+    # 使用 N 作为初始填充值，与原始代码中半径外的点的标记一致
+    group_idx = torch.full((B, S, nsample), N, dtype=torch.long, device=device)
+
+    # 计算每个查询点找到了多少个邻居
+    # unique_y_idx: 每个查询点的唯一全局索引
+    # y_inverse_indices: assign_index 中的每个条目对应 unique_y_idx 中的哪个索引
+    # counts: 每个 unique_y_idx (查询点) 对应的邻居数量 (不超过 nsample)
+    unique_y_idx, y_inverse_indices, counts = torch.unique(y_idx_flat, return_inverse=True, return_counts=True)
+
+    # 计算每个邻居在其所属查询点的邻居列表中的序号 k (0 到 count-1)
+    # 这可以通过 y_inverse_indices 创建一个从0开始的计数器来实现
+    k_indices = torch.arange(assign_index.shape[1], device=device)
+    # 计算每个 unique_y_idx 起始位置的偏移量
+    offsets = torch.zeros_like(unique_y_idx, dtype=torch.long)
+    offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+    # k = 当前全局索引 - 该查询点第一个邻居的全局索引
+    k_indices -= offsets[y_inverse_indices]
+
+    # 将找到的邻居索引填入 group_idx
+    # group_idx[b, s, k] = n
+    group_idx[b_idx, s_idx_in_batch, k_indices] = x_idx_in_batch
+
+    # 4. 处理邻居数量不足 nsample 的情况 (模拟原始代码的填充逻辑)
+    # 原始代码: 用找到的第一个邻居的索引填充空位 (值为 N 的位置)
+    # 找到 group_idx 中每个查询点的第一个有效邻居 (索引 < N)
+    # 如果 group_idx[b, s, 0] 是有效索引 (< N), 则它就是第一个邻居
+    first_neighbor_indices = group_idx[:, :, 0].clone() # 形状 [B, S]
+
+    # 创建一个 mask 标记需要填充的位置 (值为 N 且 k > 0，因为 k=0 不需要填充自己)
+    mask = (group_idx == N) & (torch.arange(nsample, device=device).view(1, 1, nsample) > 0)
+
+    # 扩展 first_neighbor_indices 以匹配 group_idx 的形状进行广播
+    first_neighbor_expanded = first_neighbor_indices.unsqueeze(-1).expand(B, S, nsample)
+
+    # 使用第一个邻居的索引填充 mask 标记的位置
+    group_idx[mask] = first_neighbor_expanded[mask]
+
+    # 最后一步特殊情况：如果一个查询点连第一个邻居都找不到 (first_neighbor_indices[b, s] == N)，
+    # 那么原始代码的行为是用 N 填充所有 nsample 个位置。
+    # 我们当前的 group_idx 在这种情况下已经是全 N 了，所以不需要额外处理。
+
     return group_idx
 
 
