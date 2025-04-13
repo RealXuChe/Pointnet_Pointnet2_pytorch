@@ -3,8 +3,6 @@ import argparse
 import os
 import yaml # For loading KITTI config
 from data_utils.KITTIDataLoader import SemanticKittiDataset # Use KITTI Loader
-# Removed: from data_utils.S3DISDataLoader import ScannetDatasetWholeScene
-# Removed: from data_utils.indoor3d_util import g_label2color
 import torch
 import logging
 from pathlib import Path
@@ -12,13 +10,10 @@ import sys
 import importlib
 from tqdm import tqdm
 import numpy as np
-# Removed: import provider
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = BASE_DIR
 sys.path.append(os.path.join(ROOT_DIR, 'models'))
-
-# Removed: Hardcoded S3DIS classes and labels
 
 def parse_args():
     '''PARAMETERS'''
@@ -43,10 +38,7 @@ def parse_args():
     parser.add_argument('--num_votes', type=int, default=5, help='Number of votes per scan [default: 5]')
     parser.add_argument('--visual', action='store_true', default=False, help='Visualize result by saving obj files [default: False]')
 
-    # Removed: --test_area
     return parser.parse_args()
-
-# Removed: add_vote function (logic moved inline)
 
 def main(args):
     def log_string(str_):
